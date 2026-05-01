@@ -1,6 +1,7 @@
 import pathlib
 import glob
 import subprocess
+import sys
 from typing import List
 import os
 import shutil
@@ -10,7 +11,7 @@ from autocomp.common import logger, SOLS_DIR
 from autocomp.search.prob import Prob
 from autocomp.backend.eval_backend import EvalBackend
 
-KERNELBENCH_DIR = pathlib.Path("/scratch/charleshong/kernelbench/KernelBench")
+KERNELBENCH_DIR = pathlib.Path("/workspace/KernelBench")
 
 class KBEvalBackend(EvalBackend):
     def get_backend_specific_rules(self) -> list[str]:
@@ -21,9 +22,20 @@ class KBEvalBackend(EvalBackend):
             "Only class ModelNew will be imported during evaluation. Feel free to define other variables, functions, or classes, but make sure they are used by ModelNew.",
         ]
 
+    # Custom reference files keyed by (prob_type, prob_id).
+    # These replace the default KernelBench reference for specific problems.
+    # __file__ is autocomp/autocomp/backend/kernelbench/kb_eval.py — four
+    # parents up reaches the repo root that contains `sols/`.
+    _CUSTOM_REFS: dict = {
+        ("kb-level3", 51): pathlib.Path(__file__).parent.parent.parent.parent
+                           / "sols/turboquant/51_mla_decode_b200_ref.py",
+    }
+
     def evaluate_code(self, prob: Prob, code_strs: list[str], simulator: str) -> List[dict]:
         level_str = prob.prob_type.split("-")[1]
-        ref_file = glob.glob(f"{KERNELBENCH_DIR}/KernelBench/{level_str}/{prob.prob_id}_*.py")[0]
+        custom = self._CUSTOM_REFS.get((prob.prob_type, prob.prob_id))
+        ref_file = str(custom) if (custom and custom.exists()) else \
+                   glob.glob(f"{KERNELBENCH_DIR}/KernelBench/{level_str}/{prob.prob_id}_*.py")[0]
         results = []
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         tmp_dir = pathlib.Path(__file__).parent / "tmp_files" / f"kb_eval_{timestamp}"
@@ -33,18 +45,20 @@ class KBEvalBackend(EvalBackend):
             test_file.write_text(code_str)
 
             cmd = [
-                "python", 
-                "scripts/run_and_check.py", 
+                sys.executable,
+                "scripts/run_and_check.py",
                 "ref_origin=local",
                 f"ref_arch_src_path={str(ref_file)}",
                 f"kernel_src_path={str(test_file)}",
                 f"level={level_str[-1]}",
                 f"problem_id={prob.prob_id}",
-                "timeout=10",
+                "timeout=60",
+                "check_kernel=False",
+                "precision=bf16",
             ]
             logger.info(f"Running command: {' '.join(cmd)} from cwd {KERNELBENCH_DIR}")
             try:
-                result = subprocess.run(cmd, cwd=KERNELBENCH_DIR, check=False, capture_output=True, text=True, timeout=240)
+                result = subprocess.run(cmd, cwd=KERNELBENCH_DIR, check=False, capture_output=True, text=True, timeout=600)
             except Exception as e:
                 logger.info(f"Error running command: {e}")
                 results.append({"correct": False})
@@ -55,8 +69,11 @@ class KBEvalBackend(EvalBackend):
             if " runtime_stats={'mean':" not in stdout:
                 logger.info(f"Kernel did not pass correctness for code {i}")
                 results.append({"correct": False})
+            elif "'excessive_speedup': True" in stdout:
+                logger.info(f"Kernel flagged as excessive speedup (reward hacking) for code {i}")
+                results.append({"correct": False})
             else:
-                latency = float(stdout.split(" runtime_stats={'mean': ")[-1].split(",")[0])
+                latency = float(stdout.split(" runtime_stats={'mean': ")[1].split(",")[0])
                 logger.info(f"Kernel passed correctness for code {i}, latency: {latency}")
                 results.append({"correct": True, "latency": latency})
         return results

@@ -178,3 +178,6 @@ wandb/
 config/
 tmp*/
 temp*/
+
+# Generated turboquant sol files (built from template at run time)
+sols/turboquant/51_mla_decode_b200.py

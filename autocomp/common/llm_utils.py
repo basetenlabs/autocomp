@@ -6,6 +6,12 @@ import copy
 import time
 import contextvars
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import boto3
 from openai import OpenAI, AsyncOpenAI
 from google import genai
@@ -48,6 +54,7 @@ google_cloud_project = _get_key("GOOGLE_CLOUD_PROJECT", default=None)
 google_cloud_location = _get_key("GOOGLE_CLOUD_LOCATION", default=None)
 google_api_key = _get_key("GOOGLE_API_KEY", default=None)
 vllm_api_base = _get_key("VLLM_API_BASE", default="http://localhost:8000/v1")
+baseten_api_key = _get_key("BASETEN_API_KEY", default=None)
 
 # Log key availability
 _key_status = {
@@ -59,6 +66,7 @@ _key_status = {
     "GOOGLE_CLOUD_PROJECT": google_cloud_project is not None,
     "GOOGLE_CLOUD_LOCATION": google_cloud_location is not None,
     "GOOGLE_API_KEY": google_api_key is not None,
+    "BASETEN_API_KEY": baseten_api_key is not None,
 }
 _available = [k for k, v in _key_status.items() if v]
 _unavailable = [k for k, v in _key_status.items() if not v]
@@ -810,6 +818,17 @@ class LLMClient:
                 api_key=openai_api_key,
                 base_url=openai_api_base,
             )
+        elif self.provider == "baseten":
+            # Baseten Model APIs: OpenAI-compatible at inference.baseten.co/v1
+            # Model IDs use "/" (e.g. "zai/glm-5"); accept "." as separator in config.
+            # self.model keeps the "." form so it's safe to embed in file paths;
+            # _api_model holds the "/" form used only for the actual HTTP call.
+            self._api_model = self.model.replace(".", "/", 1)
+            self.async_client = AsyncOpenAI(
+                api_key=baseten_api_key,
+                base_url="https://inference.baseten.co/v1",
+            )
+            self.provider = "vllm"  # reuse OpenAI chat completions path
         elif self.provider == "dummy":
             pass
         else:
@@ -885,13 +904,14 @@ class LLMClient:
         Returns normalized dict: {"role": "assistant", "content": ..., "tool_calls": [...], "usage": {...}}."""
         semaphore = asyncio.Semaphore(1)
         bedrock = getattr(self, "_bedrock_client", None)
+        call_model = getattr(self, "_api_model", self.model)
         result = self._run_async(
             fetch_tool_completion(
                 semaphore,
                 self.async_client,
                 messages,
                 provider=self.provider,
-                model=self.model,
+                model=call_model,
                 tools=tools,
                 response_format=response_format,
                 temperature=temperature,
@@ -942,6 +962,7 @@ class LLMClient:
 
         MAX_CONCURRENT = 9
         bedrock = getattr(self, "_bedrock_client", None)
+        call_model = getattr(self, "_api_model", self.model)
 
         async def _run():
             semaphore = asyncio.Semaphore(MAX_CONCURRENT)
@@ -954,7 +975,7 @@ class LLMClient:
                             self.async_client,
                             copy.deepcopy(messages),
                             provider=self.provider,
-                            model=self.model,
+                            model=call_model,
                             tools=tools,
                             response_format=response_format,
                             temperature=temperature,
