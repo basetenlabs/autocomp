@@ -25,6 +25,7 @@ import importlib.util
 import math
 import pathlib
 import sys
+import tempfile
 
 import torch
 
@@ -100,6 +101,19 @@ CUDA_FLAGS = [
     "-DTQ_NO_TORCH_LIBRARY",
 ]
 CXX_FLAGS = ["-std=c++17"]
+
+
+def materialize_local_headers(headers: dict[str, str]) -> str:
+    '''Write each (header_name, body) pair to a fresh tempdir and return
+    its path. Prepend the result to `extra_include_paths` so the inline
+    build's `#include "..."` directives resolve to the agent's edits
+    rather than the original turboquant source on disk.'''
+    d = pathlib.Path(tempfile.mkdtemp(prefix="autocomp_local_hdrs_"))
+    for name, content in headers.items():
+        f = d / name
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(content)
+    return str(d)
 
 # --- inline-module sharing across exec contexts --------------------------
 # torch's load_inline() does NOT register the compiled extension in

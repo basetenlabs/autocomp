@@ -1,11 +1,20 @@
 """
 TurboQuant 4-bit MLA decode (Blackwell sm100) — autocomp solution shell.
 
-The CUDA source below (CUDA_SOURCE) is the ONLY thing the agent should
-edit. All Python wiring lives in `_mla_decode_helpers.py`. `run_search.py`
-embeds the latest `tq_mla_decode_tcgen05_4bit.cu` into the CUDA_SOURCE
-sentinel before each run and writes the optimized kernel back to disk
-afterwards.
+`run_search.py` populates the embed block below before each run with
+two values the agent is free to edit:
+
+  * `CUDA_SOURCE`  — the main `.cu` translation unit (with its
+                     `#include "..."` directives left intact).
+  * `LOCAL_HEADERS` — `{header_name: source}` for every local turboquant
+                     header transitively included from CUDA_SOURCE.
+                     `materialize_local_headers` writes them to a
+                     tempdir before `load_inline` so the directives in
+                     CUDA_SOURCE resolve to *these* edits, not the
+                     pristine turboquant copies.
+
+After the run, the optimized blobs are split back into per-file `.cu` /
+`.hpp` / `.cuh` artifacts under `output/<run>/best_kernel/`.
 
 `tq_mla_decode` is the high-level pybind11 entry point exposed by the
 embedded TU; it Hadamard-rotates Q, runs the 4-bit kernel, and
@@ -26,12 +35,13 @@ from torch.utils.cpp_extension import load_inline
 
 # __CUDA_SOURCE_BEGIN__
 CUDA_SOURCE = ""
+LOCAL_HEADERS: dict[str, str] = {}
 # __CUDA_SOURCE_END__
 
 _tq = load_inline(
     name="tq_mla_decode_tcgen05_inline",
     cpp_sources=[""], cuda_sources=[CUDA_SOURCE],
-    extra_include_paths=_h.INCLUDE_PATHS,
+    extra_include_paths=[_h.materialize_local_headers(LOCAL_HEADERS), *_h.INCLUDE_PATHS],
     extra_cuda_cflags=_h.CUDA_FLAGS,
     extra_cflags=_h.CXX_FLAGS,
     verbose=False,

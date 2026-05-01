@@ -291,32 +291,35 @@ def _strip_c_comments(code: str) -> str:
     return code.strip()
 
 
-def _inline_local_includes(
+def _discover_local_headers(
     src: str,
     src_dir: pathlib.Path,
     local_dirs: list[pathlib.Path] | None = None,
-    seen: set | None = None,
-) -> str:
-    '''Recursively inline `#include "..."` headers found in `src_dir` or
-    `local_dirs`. Angle-bracket includes are left for the compiler.'''
-    if seen is None:
-        seen = set()
-    search_dirs = [src_dir] + list(local_dirs or [])
+) -> dict[str, str]:
+    '''Walk `#include "..."` directives transitively and collect their bodies.
 
-    def _replace(m):
-        header = m.group(1)
-        for search_dir in search_dirs:
-            candidate = (search_dir / header).resolve()
-            if candidate.exists():
-                if candidate in seen:
-                    return f"// {header} already inlined"
-                seen.add(candidate)
-                content = _inline_local_includes(
-                    candidate.read_text(), candidate.parent, local_dirs, seen)
-                return f"// ---- begin {header} ----\n{content}\n// ---- end {header} ----"
-        return m.group(0)
-
-    return _INCLUDE_PATTERN.sub(_replace, src)
+    Returns a flat dict keyed by the header name as it appears in the
+    `#include` directive (so the embedded sol can write each one to a
+    tempdir for the compiler to find). Headers not found in `src_dir` or
+    `local_dirs` are left for `extra_include_paths` to resolve.
+    '''
+    headers: dict[str, str] = {}
+    extra = list(local_dirs or [])
+    queue: list[tuple[str, pathlib.Path]] = [(src, src_dir)]
+    while queue:
+        text, owner_dir = queue.pop()
+        for m in _INCLUDE_PATTERN.finditer(text):
+            header = m.group(1)
+            if header in headers:
+                continue
+            for d in [owner_dir] + extra:
+                candidate = (d / header).resolve()
+                if candidate.exists():
+                    content = candidate.read_text()
+                    headers[header] = content
+                    queue.append((content, candidate.parent))
+                    break
+    return headers
 
 
 def _embed_kernel(
@@ -326,19 +329,26 @@ def _embed_kernel(
     local_include_dirs: list[pathlib.Path] | None = None,
     strip_comments: bool = True,
 ) -> None:
-    '''Embed `cu_path` into the `_CUDA_SOURCE_BEGIN/END` block of `template_path`.'''
+    '''Embed `cu_path` and its local headers as separate string variables in
+    the `_CUDA_SOURCE_BEGIN/END` block of `template_path`. Each header is
+    its own dict entry under `LOCAL_HEADERS`; the main TU keeps its
+    `#include "..."` directives so the agent's view stays per-file.'''
     cu_src = cu_path.read_text()
-    inlined = _inline_local_includes(cu_src, cu_path.parent, local_include_dirs)
-    cuda_body = _strip_c_comments(inlined) if strip_comments else inlined
+    headers = _discover_local_headers(cu_src, cu_path.parent, local_include_dirs)
+    if strip_comments:
+        cu_src  = _strip_c_comments(cu_src)
+        headers = {k: _strip_c_comments(v) for k, v in headers.items()}
 
-    # Double-escape so Python's string literal parser yields the original
-    # bytes back (e.g. `\n` in PTX inline asm stays a literal backslash+n).
-    safe_body = cuda_body.replace("\\", "\\\\").replace('"""', r'\"\"\"')
-    new_block = (
-        f"{_CUDA_SOURCE_BEGIN}\n"
-        f'CUDA_SOURCE = """\n{safe_body}\n"""\n'
-        f"{_CUDA_SOURCE_END}"
-    )
+    parts = [f'CUDA_SOURCE = {_emit_triple_quoted(cu_src)}', ""]
+    if headers:
+        parts.append("LOCAL_HEADERS: dict[str, str] = {")
+        for name, content in headers.items():
+            parts.append(f"    {name!r}: {_emit_triple_quoted(content)},")
+        parts.append("}")
+    else:
+        parts.append("LOCAL_HEADERS: dict[str, str] = {}")
+
+    new_block = f"{_CUDA_SOURCE_BEGIN}\n" + "\n".join(parts) + f"\n{_CUDA_SOURCE_END}"
     result, n_subs = re.subn(
         rf"{re.escape(_CUDA_SOURCE_BEGIN)}\n.*?{re.escape(_CUDA_SOURCE_END)}",
         lambda _: new_block,
@@ -351,66 +361,119 @@ def _embed_kernel(
             f"{_CUDA_SOURCE_BEGIN!r} / {_CUDA_SOURCE_END!r} sentinel block."
         )
     out_path.write_text(result)
-    logger.info("Embedded kernel (%d lines) into %s", cuda_body.count("\n"), out_path.name)
+    total_lines = cu_src.count("\n") + sum(v.count("\n") for v in headers.values())
+    logger.info(
+        "Embedded kernel (%d lines, %d local header(s)) into %s",
+        total_lines, len(headers), out_path.name,
+    )
 
 
-def _extract_cuda_source(src: str) -> str | None:
-    '''Recover the literal value of `CUDA_SOURCE = ...`.
+def _emit_triple_quoted(s: str) -> str:
+    '''Format `s` as `"""\n...\n"""` with backslashes/triple-quotes escaped
+    so the round-trip through Python's string-literal parser is exact.'''
+    safe = s.replace("\\", "\\\\").replace('"""', r'\"\"\"')
+    return f'"""\n{safe}\n"""'
 
-    Uses `ast.parse` to handle raw strings, escape variations, and missing
-    sentinel comments (the LLM frequently drops them); falls back to a
-    permissive regex when the candidate isn't yet valid Python.
+
+def _extract_kernel_sources(src: str) -> tuple[str | None, dict[str, str]]:
+    '''Recover `(CUDA_SOURCE, LOCAL_HEADERS)` from a candidate's Python source.
+
+    Uses `ast.parse` so the result is robust to raw strings, escape
+    variations, and dropped sentinel comments. Falls back to a permissive
+    `CUDA_SOURCE` regex (headers only via AST) when the candidate isn't
+    yet valid Python.
     '''
     import ast
+    cuda_source: str | None = None
+    local_headers: dict[str, str] = {}
+
+    def _str_const(node) -> str | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            v = node.value
+            if v.startswith("\n"): v = v[1:]
+            if v.endswith("\n"):   v = v[:-1]
+            return v
+        return None
+
     try:
         tree = ast.parse(src)
     except SyntaxError:
         tree = None
     if tree is not None:
         for node in ast.walk(tree):
-            if isinstance(node, ast.Assign) and any(
-                isinstance(t, ast.Name) and t.id == "CUDA_SOURCE"
-                for t in node.targets
-            ) and isinstance(node.value, ast.Constant) \
-                    and isinstance(node.value.value, str):
-                # `"""\n...\n"""` (embed format) adds bracketing newlines;
-                # strip one of each for a byte-exact round-trip.
-                body = node.value.value
-                if body.startswith("\n"): body = body[1:]
-                if body.endswith("\n"):   body = body[:-1]
-                return body
+            # Plain `X = ...` and annotated `X: T = ...` look different in
+            # the AST but mean the same thing here.
+            if isinstance(node, ast.Assign):
+                targets = [t for t in node.targets if isinstance(t, ast.Name)]
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) \
+                    and node.value is not None:
+                targets = [node.target]
+            else:
+                continue
+            value = node.value
+            for tgt in targets:
+                if tgt.id == "CUDA_SOURCE":
+                    cuda_source = _str_const(value)
+                elif tgt.id == "LOCAL_HEADERS" and isinstance(value, ast.Dict):
+                    for k_node, v_node in zip(value.keys, value.values):
+                        if isinstance(k_node, ast.Constant) \
+                                and isinstance(k_node.value, str):
+                            v = _str_const(v_node)
+                            if v is not None:
+                                local_headers[k_node.value] = v
+        if cuda_source is not None:
+            return cuda_source, local_headers
 
+    # Regex fallback (CUDA_SOURCE only) for mid-edit / invalid-Python candidates.
     m = re.search(
         r'CUDA_SOURCE\s*=\s*(r?)("""|\'\'\')\n?(.*?)\n?\2',
         src, re.DOTALL,
     )
     if m is None:
-        return None
+        return None, {}
     body = m.group(3)
     if not m.group(1):
         try:
             body = body.encode("utf-8").decode("unicode_escape")
         except UnicodeDecodeError:
             body = body.replace("\\\\", "\\")
-    return body
+    return body, {}
 
 
 def _write_back_best_kernel(output_dir: pathlib.Path) -> pathlib.Path | None:
-    '''Extract `CUDA_SOURCE` from `best_candidate_so_far.py` to `best_kernel.cu`.'''
+    '''Extract `CUDA_SOURCE` (and any `LOCAL_HEADERS`) from
+    `best_candidate_so_far.py` and write them back as a per-file tree
+    under `<output_dir>/best_kernel/`.'''
     best_py = output_dir / "best_candidate_so_far.py"
     if not best_py.exists():
         logger.warning("No best_candidate_so_far.py found; skipping kernel write-back.")
         return None
 
-    cuda_body = _extract_cuda_source(best_py.read_text())
+    cuda_body, headers = _extract_kernel_sources(best_py.read_text())
     if cuda_body is None:
         logger.warning("CUDA_SOURCE assignment not found in best candidate; skipping write-back.")
         return None
 
-    out_cu = output_dir / "best_kernel.cu"
-    out_cu.write_text(cuda_body)
-    logger.info("Best optimized kernel written to %s/%s", output_dir.name, out_cu.name)
-    return out_cu
+    if not headers:
+        # Single-file kernel — keep the flat artifact.
+        out_cu = output_dir / "best_kernel.cu"
+        out_cu.write_text(cuda_body)
+        logger.info("Best optimized kernel written to %s/%s", output_dir.name, out_cu.name)
+        return out_cu
+
+    out_dir = output_dir / "best_kernel"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    main_cu = out_dir / "kernel.cu"
+    main_cu.write_text(cuda_body)
+    for name, content in headers.items():
+        f = out_dir / name
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(content)
+    logger.info(
+        "Best optimized kernel written to %s/best_kernel/ (1 .cu + %d header(s))",
+        output_dir.name, len(headers),
+    )
+    return main_cu
 
 
 if __name__ == "__main__":
