@@ -284,6 +284,9 @@ _INCLUDE_PATTERN   = re.compile(r'#include\s+"([^"]+)"')
 def _strip_c_comments(code: str) -> str:
     code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
     code = re.sub(r'//[^\n]*', '', code)
+    # Stripped comments leave trailing or whitespace-only lines; flatten
+    # those before collapsing blank-line runs.
+    code = re.sub(r'[ \t]+\n', '\n', code)
     code = re.sub(r'\n{3,}', '\n\n', code)
     return code.strip()
 
