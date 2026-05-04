@@ -41,24 +41,12 @@ def main():
     # hw_config = MetalHardwareConfig("M2", "4.0", "apple8", 8)
 
     prob_type = "kb-level3"              # see README.md or sols/ for available problems
-    prob_id = 51                         # KernelBench/level3/51_mla_decode_b200.py
+    prob_id = 51
 
-    # ------------------------------------------------------------------
-    # Optional: external CUDA kernel round-tripped each run. Set
-    # `kernel_cu_path = None` for problems whose sol file is the source of
-    # truth (no separate `.cu` to embed).
-    # ------------------------------------------------------------------
-    sol_file: pathlib.Path | None = pathlib.Path(
-        "sols/turboquant/51_mla_decode_b200.py"
-    )
-    kernel_cu_path: pathlib.Path | None = pathlib.Path(
-        "/workspace/turboquant/csrc/decode_mla_tcgen05/"
-        "tq_mla_decode_tcgen05_4bit.cu"
-    )
-    kernel_template: pathlib.Path | None = pathlib.Path(
-        "sols/turboquant/51_mla_decode_b200_template.py"
-    )
-    kernel_local_includes: list[pathlib.Path] = [
+    sol_file = pathlib.Path("sols/turboquant/51_mla_decode_b200.py")
+    kernel_cu_path = pathlib.Path("/workspace/turboquant/csrc/decode_mla_tcgen05/tq_mla_decode_tcgen05_4bit.cu")
+    kernel_template = pathlib.Path("sols/turboquant/51_mla_decode_b200_template.py")
+    kernel_local_includes = [
         pathlib.Path("/workspace/turboquant/csrc/decode_mla_tcgen05"),
         pathlib.Path("/workspace/turboquant/csrc/shared"),
     ]
@@ -89,7 +77,7 @@ def main():
     # ------------------------------------------------------------------
     search_strategy = "beam"
     metric = "latency"
-    iterations = 8
+    iterations = 20
     num_plan_candidates = 7
     num_code_candidates = 3
     beam_size = 4
@@ -102,7 +90,7 @@ def main():
     # ------------------------------------------------------------------
     # Code generation
     # ------------------------------------------------------------------
-    use_edits = False
+    use_edits = True
     reimplement_failed = False
 
     # ------------------------------------------------------------------

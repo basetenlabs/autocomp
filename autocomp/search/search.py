@@ -539,6 +539,88 @@ class SearchStrategy:
                 candidates[cand_i].stderr = stats["stderr"]
         return candidates
 
+    def _revalidate_parents_or_fallback(
+        self,
+        current_candidates: list[CodeCandidate],
+        iter_idx: int,
+        retries: int = 3,
+    ) -> list[CodeCandidate]:
+        """Re-validate carried-over beam parents against the *current* ref.
+
+        Why this exists: the score-only beam filter never displaces an
+        incumbent on its stored latency. A hot-swapped or strengthened ref
+        can leave previously-passing candidates as silent ghosts: their
+        old score (achieved on a weaker ref) wins ties forever, the agent
+        burns a beam slot mutating broken DNA every iteration, and any
+        legit successor scoring above the ghost is permanently filtered.
+        Catching this requires actually re-running them.
+
+        Robustness:
+          - Best-of-K retry (default K=3) absorbs the kernel's bf16
+            reduction-order ULP noise. KB's atol gives only ~4× headroom
+            over the measured noise floor (~2.4e-3 vs 1e-2), so a single
+            healthy run can flake; three independent runs essentially
+            never all flake unless the candidate is genuinely broken.
+          - The candidate's persisted `.score` is restored after the
+            decision. Revalidation is a *gate* for this iteration's
+            parent set, not a permanent re-rating — a future iteration
+            will give a transiently-flaky candidate another shot.
+          - Skipped at iter_idx == 1 because current_candidates is the
+            initial code, freshly evaluated at startup against this ref.
+
+        Returns the surviving subset (not a copy of the originals — same
+        Python objects, with their scores restored). Falls back to the
+        initial code (repo iteration 0) if every parent fails.
+        """
+        if iter_idx < 2 or not current_candidates:
+            return current_candidates
+
+        eligible = [c for c in current_candidates if c.score != float("inf")]
+        if not eligible:
+            return current_candidates
+
+        original_scores = {id(c): c.score for c in eligible}
+        survivors_id: set[int] = set()
+        flipped: list[tuple[float, int]] = []  # (orig_score, attempts_used)
+
+        for c in eligible:
+            attempts_used = 0
+            for attempt in range(retries):
+                attempts_used += 1
+                reval_dir = (
+                    self.output_dir / f"revalidate-iter-{iter_idx}-attempt-{attempt}"
+                )
+                reval_dir.mkdir(parents=True, exist_ok=True)
+                self.evaluate_candidates(
+                    [c], metric=self.metric, cur_iter=iter_idx,
+                    save_dir=reval_dir, use_cache=False,
+                )
+                if c.score != float("inf"):
+                    survivors_id.add(id(c))
+                    break
+            if id(c) not in survivors_id:
+                flipped.append((original_scores[id(c)], attempts_used))
+            # Restore persisted score regardless of outcome — see docstring.
+            c.score = original_scores[id(c)]
+
+        if flipped:
+            logger.warning(
+                "Re-validation iter %d: %d/%d carried-over parents failed all "
+                "%d retries under the current ref. Excluding from this iteration's "
+                "parent set (stored scores preserved). Failed: %s",
+                iter_idx, len(flipped), len(eligible), retries,
+                [f"{prev:.4f}(x{n})" for prev, n in flipped],
+            )
+
+        survivors = [c for c in current_candidates if id(c) in survivors_id]
+        if survivors:
+            return survivors
+        logger.error(
+            "Re-validation iter %d: every parent failed. Falling back to the "
+            "initial code candidate.", iter_idx,
+        )
+        return self.repository.get_candidates(0)
+
     def _score_translation(
         self,
         candidates: list[CodeCandidate],
@@ -811,6 +893,10 @@ class ExhaustiveSearchStrategy(SearchStrategy):
                 )
                 cur_cand_idx -= 1
                 current_candidates = self.repository.get_candidates(cur_cand_idx)
+
+            current_candidates = self._revalidate_parents_or_fallback(
+                current_candidates, iter_idx=i,
+            )
 
             cur_cand_scores = [cand.score for cand in current_candidates]
             best_loss = min(cur_cand_scores)
@@ -1188,6 +1274,10 @@ class BeamSearchStrategy(SearchStrategy):
                 )
                 cur_cand_idx -= 1
                 current_candidates = self.repository.get_candidates(cur_cand_idx)
+
+            current_candidates = self._revalidate_parents_or_fallback(
+                current_candidates, iter_idx=i,
+            )
 
             cur_cand_scores = [cand.score for cand in current_candidates]
             best_loss = min(cur_cand_scores)

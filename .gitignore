@@ -178,6 +178,16 @@ wandb/
 config/
 tmp*/
 temp*/
+nohup.out
+test_build/
 
-# Generated turboquant sol files (built from template at run time)
-sols/turboquant/51_mla_decode_b200.py
+# Generated turboquant sol files (built from template at run time).
+# Pattern: files starting with a digit and ending exactly in `_b200.py`
+# are agent-editable copies embedded by run_search._embed_kernel from
+# the corresponding `<id>_..._template.py`. The `_ref.py` / `_template.py`
+# siblings are sources and remain tracked.
+sols/turboquant/[0-9]*_b200.py
+
+# Large precomputed reference tensors produced by sols/turboquant/_gen_*.py.
+# Multi-MB and regenerable; the generators themselves are tracked.
+sols/turboquant/_*_ref_outputs.pt

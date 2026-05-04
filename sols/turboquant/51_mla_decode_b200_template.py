@@ -46,8 +46,6 @@ _tq = load_inline(
     extra_cflags=_h.CXX_FLAGS,
     verbose=False,
 )
-# Make the inline binary visible to the standalone-ref timing pass; see
-# `_mla_decode_helpers.share_inline_module` for why.
 _h.share_inline_module(_tq)
 
 

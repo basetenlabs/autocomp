@@ -11,9 +11,9 @@ Holds everything that has nothing to do with kernel optimization:
   - Inline-build flags + include paths used by load_inline().
   - Cross-context inline-module sharing via a sentinel sys.modules key,
     so the KernelBench standalone-ref timing pass can reuse the agent's
-    inline `.so` instead of loading the prebuilt 4-bit `.so` (which would
-    collide with the inline build's CUTLASS Sm100 cluster-launch kernel
-    symbols and crash inside `cudaLaunchKernelExC`).
+    inline `.so` instead of loading the prebuilt 4-bit `.so` (which
+    would collide with the inline build's CUTLASS Sm100 cluster-launch
+    kernel symbols and crash inside `cudaLaunchKernelExC`).
   - `tq_mla_decode_kwargs(...)` packs the long pybind11 keyword-arg list
     so ModelNew's forward stays a one-liner.
 
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import importlib.util
 import math
+import os as _os
 import pathlib
 import sys
 import tempfile
@@ -53,12 +54,13 @@ KPE_STEP, KPE_BIAS, _kpe_thresh = _compute_uniform_params(head_dim=D_KPE, num_bi
 CKV_THRESH = torch.tensor(_ckv_thresh, dtype=torch.float32, device="cuda")
 KPE_THRESH = torch.tensor(_kpe_thresh, dtype=torch.float32, device="cuda")
 
-# --- prebuilt encode_mla_paged.so ----------------------------------------
+# --- extension `.so` loaders ---------------------------------------------
 def _load_so(path: str | pathlib.Path, modname: str):
     spec = importlib.util.spec_from_file_location(modname, str(path))
     mod  = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
 
 _ENC = _load_so(
     "/workspace/turboquant/build/lib/encode_mla_paged.cpython-312-x86_64-linux-gnu.so",
@@ -66,7 +68,6 @@ _ENC = _load_so(
 )
 
 # --- inline-build flags ---------------------------------------------------
-import os as _os
 _os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "10.0a")
 
 _TQ_CSRC       = pathlib.Path("/workspace/turboquant/csrc")
@@ -114,6 +115,7 @@ def materialize_local_headers(headers: dict[str, str]) -> str:
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(content)
     return str(d)
+
 
 # --- inline-module sharing across exec contexts --------------------------
 # torch's load_inline() does NOT register the compiled extension in
@@ -223,6 +225,78 @@ def tq_mla_decode_kwargs(
         d_ckv_override=D_CKV, d_kpe_override=D_KPE,
         output_buf=None, q_rot_buf=None,
     )
+
+
+# --- python ground-truth reference ---------------------------------------
+# Mirrors the kernel pipeline in plain torch so KernelBench compares the
+# kernel against the SAME algorithm (encode → 4-bit pool → SDPA), not
+# against the lossless fp32 ground truth. The diff this exposes is purely
+# implementation: tile order, accumulation precision, sync correctness —
+# i.e. the kinds of bugs the agent can introduce while editing the .cu.
+#
+# Note: the kernel's Hadamard rotate of Q + un-rotate of out cancels with
+# the encoder's rotate of K (orthonormal H). We bypass the rotate entirely
+# in this reference and compare the bit-equivalent post-rotation result.
+def dequant_pool_to_cache(pool: torch.Tensor) -> torch.Tensor:
+    """Vectorized 4-bit pool → bf16 [num_pages, page_size, D_TOTAL] cache.
+
+    Matches the kernel's dequant formula exactly:
+      dq[i] = norm * (step * nibble_i + bias)
+    with `nibble_i = (byte[i//2] >> ((i&1)*4)) & 0xF`.
+    """
+    NP, PS, _ = pool.shape
+    dev = pool.device
+
+    ckv_bytes = pool[..., CKV_DATA_OFF:CKV_DATA_OFF + D_CKV // 2].to(torch.int32)
+    kpe_bytes = pool[..., KPE_DATA_OFF:KPE_DATA_OFF + D_KPE // 2].to(torch.int32)
+
+    ckv_lo = (ckv_bytes & 0xF).to(torch.float32)
+    ckv_hi = ((ckv_bytes >> 4) & 0xF).to(torch.float32)
+    ckv_f  = torch.stack([ckv_lo, ckv_hi], dim=-1).flatten(-2)  # [NP, PS, D_CKV]
+
+    kpe_lo = (kpe_bytes & 0xF).to(torch.float32)
+    kpe_hi = ((kpe_bytes >> 4) & 0xF).to(torch.float32)
+    kpe_f  = torch.stack([kpe_lo, kpe_hi], dim=-1).flatten(-2)  # [NP, PS, D_KPE]
+
+    # `view(bf16)` requires a contiguous trailing axis of size 2 in bytes.
+    ckv_norm = pool[..., CKV_NORM_OFF:CKV_NORM_OFF + 2].contiguous() \
+        .view(torch.bfloat16).squeeze(-1).float()  # [NP, PS]
+    kpe_norm = pool[..., KPE_NORM_OFF:KPE_NORM_OFF + 2].contiguous() \
+        .view(torch.bfloat16).squeeze(-1).float()
+
+    cache = torch.empty(NP, PS, D_TOTAL, dtype=torch.bfloat16, device=dev)
+    cache[..., :D_CKV] = (ckv_norm.unsqueeze(-1) * (CKV_STEP * ckv_f + CKV_BIAS)).to(torch.bfloat16)
+    cache[..., D_CKV:] = (kpe_norm.unsqueeze(-1) * (KPE_STEP * kpe_f + KPE_BIAS)).to(torch.bfloat16)
+    return cache
+
+
+def mla_reference(q: torch.Tensor, paged_cache: torch.Tensor,
+                  seq_lens: torch.Tensor, softmax_scale: float,
+                  page_table: torch.Tensor, page_size: int) -> torch.Tensor:
+    """Naive fp32 MLA decode against a (already-quantized) bf16 paged cache.
+
+    Mathematically: out[b,h] = softmax(q[b,h] @ K^T * scale)[seq_lens[b]] @ V
+    where V = K[:, :D_CKV] (MLA shares the latent for K and V).
+    Output dtype matches q (bf16).
+    """
+    B, H_runtime, _ = q.shape
+    out = torch.empty(B, H_runtime, D_CKV, dtype=torch.float32, device=q.device)
+    for b in range(B):
+        L = int(seq_lens[b].item())
+        if L == 0:
+            out[b].zero_()
+            continue
+        pages = page_table[b].tolist()
+        rows = []
+        for p in range((L + page_size - 1) // page_size):
+            take = min(page_size, L - p * page_size)
+            rows.append(paged_cache[pages[p], :take].float())
+        kv = torch.cat(rows, dim=0)            # [L, D_TOTAL] fp32
+        scores = (q[b].float() @ kv.T) * softmax_scale  # [H, L]
+        m = scores.max(dim=-1, keepdim=True).values
+        probs = torch.softmax(scores - m, dim=-1)
+        out[b] = probs @ kv[:, :D_CKV]
+    return out.to(q.dtype)
 
 
 # --- pool-cache key fingerprint ------------------------------------------

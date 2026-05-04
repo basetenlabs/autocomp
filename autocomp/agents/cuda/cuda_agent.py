@@ -9,6 +9,56 @@ from autocomp.agents.cuda.prompts import tensor_examples
 from autocomp.hw_config.cuda_config import CudaHardwareConfig
 from autocomp.backend.eval_backend import EvalBackend
 
+
+# System prompts for the structured-edits path. Mirror BuiltLLMAgent's blocks
+# (built_agent.py:875-886, 1029-1040) verbatim — the schema is shared.
+_EDITS_SYSTEM_PROMPT = (
+    "You are an expert performance engineer. "
+    "You modify high-performance code by outputting precise code edits.\n\n"
+    "You MUST respond with ONLY a JSON object in this exact format:\n"
+    '{"plan": "<brief reasoning about which optimization to apply and why>", '
+    '"edits": [{"old_str": "<exact code to find>", "new_str": "<replacement code>"}, ...]}\n\n'
+    "Rules for edits:\n"
+    "- Each old_str must be an EXACT substring of the current code. All occurrences are replaced.\n"
+    "- Include enough context in old_str to target specific locations.\n"
+    "- Edits are applied sequentially, so later edits see the result of earlier ones.\n"
+    "- Do NOT output anything outside the JSON object.\n"
+)
+
+_EDITS_FAILED_SYSTEM_PROMPT = (
+    "You are an expert performance engineer. "
+    "You fix failed high-performance code by outputting precise code edits.\n\n"
+    "You MUST respond with ONLY a JSON object in this exact format:\n"
+    '{"plan": "<brief reasoning about what caused the failure and how the edits fix it>", '
+    '"edits": [{"old_str": "<exact code to find>", "new_str": "<replacement code>"}, ...]}\n\n'
+    "Rules for edits:\n"
+    "- Each old_str must be an EXACT substring of the current code. All occurrences are replaced.\n"
+    "- Include enough context in old_str to target specific locations.\n"
+    "- Edits are applied sequentially, so later edits see the result of earlier ones.\n"
+    "- Do NOT output anything outside the JSON object.\n"
+)
+
+# `_get_prompt_rules(coding=True)` injects a "wrap with ```python" rule that
+# directly contradicts the JSON-edits format. Swap it out and replace the
+# trailing "Optimized code:" cue with an edits-specific cue.
+_WRAP_PYTHON_RULE = "Wrap the generated code with ```python at the beginning and ``` at the end."
+_EDITS_RULE_REPLACEMENT = (
+    "Output ONLY the JSON object described in the system prompt — "
+    "do NOT wrap it in markdown fences or any other formatting."
+)
+_OPTIMIZED_CODE_CUE = "Optimized code:"
+_EDITS_USER_CUE = "Output the JSON edits now."
+
+
+def _to_edits_user_prompt(prompt_text: str) -> str:
+    """Adapt a code-generation prompt body for the structured-edits path."""
+    return (
+        prompt_text
+        .replace(_WRAP_PYTHON_RULE, _EDITS_RULE_REPLACEMENT)
+        .replace(_OPTIMIZED_CODE_CUE, _EDITS_USER_CUE)
+    )
+
+
 class CudaLLMAgent(LLMAgent):
     def __init__(self, model, hw_config: CudaHardwareConfig, eval_backend: EvalBackend):
         super().__init__(model)
@@ -290,3 +340,81 @@ Speedup can be increased by using the following optimizations:
         prompt_text += self._get_prompt_rules(planning=False, coding=True)
         prompt_text += "Optimized code:"
         return prompt_text
+
+    # ------------------------------------------------------------------
+    # Structured-edits path (used when run_search.py sets `use_edits=True`).
+    # `_run_edits_pipeline` in llm_agent.py expects a `messages_lst`-shaped
+    # return; the user prompt is reused from the existing string-builders
+    # via `_to_edits_user_prompt` so the menu / score-feedback / rules
+    # scaffolding stays in one place.
+    # ------------------------------------------------------------------
+
+    def _get_implement_edits_messages(
+        self, candidate: CodeCandidate, prob: Prob = None,
+    ) -> list[dict]:
+        user = _to_edits_user_prompt(
+            self._get_implement_code_prompt(candidate, prob)
+        )
+        return [
+            {"role": "system", "content": _EDITS_SYSTEM_PROMPT},
+            {"role": "user", "content": user},
+        ]
+
+    def _get_direct_implement_edits_messages(
+        self, candidate: CodeCandidate, prob: Prob,
+        give_score_feedback: float = 1.0,
+        give_hw_feedback: float = 1.0,
+        include_ancestors: bool = False,
+        dropout_menu_options: float = 1.0,
+        cur_iter: int = None,
+        num_iters: int = None,
+        translate: bool = False,
+    ) -> list[dict]:
+        user = _to_edits_user_prompt(
+            self._get_direct_implement_prompt(
+                candidate, prob,
+                give_score_feedback=give_score_feedback,
+                give_hw_feedback=give_hw_feedback,
+                include_ancestors=include_ancestors,
+                dropout_menu_options=dropout_menu_options,
+                cur_iter=cur_iter,
+                num_iters=num_iters,
+                translate=translate,
+            )
+        )
+        return [
+            {"role": "system", "content": _EDITS_SYSTEM_PROMPT},
+            {"role": "user", "content": user},
+        ]
+
+    def _get_reimplement_failed_edits_messages(
+        self, candidate: CodeCandidate, prob: Prob = None,
+    ) -> list[dict]:
+        # CudaLLMAgent has no `_get_reimplement_failed_code_prompt` to mirror,
+        # so build the failure context inline. Shape matches BuiltLLMAgent's
+        # version (built_agent.py:1024-1080): current code, then truncated
+        # stderr/stdout, then the rules block (without the wrap-in-```python
+        # rule, which contradicts the JSON-edits format).
+        user = "\nThe current code is:\n```python\n"
+        user += candidate.code
+        user += "\n```\n"
+
+        user += "\nHowever, the code failed with the following output:\n"
+        if candidate.stderr:
+            user += "=== STDERR ===\n"
+            stderr_lines = [line[:400] for line in candidate.stderr.split("\n")]
+            user += "\n".join(stderr_lines) + "\n"
+        if candidate.stdout:
+            user += "=== STDOUT ===\n"
+            stdout_lines = [line[:400] for line in candidate.stdout.split("\n")]
+            user += "\n".join(stdout_lines) + "\n"
+
+        user += "\nPlease fix the code by outputting JSON edits.\n"
+        user += "\nMake sure to follow these rules:"
+        user += self._get_prompt_rules(planning=False, coding=False)
+        user += f"\n{_EDITS_USER_CUE}"
+
+        return [
+            {"role": "system", "content": _EDITS_FAILED_SYSTEM_PROMPT},
+            {"role": "user", "content": user},
+        ]
