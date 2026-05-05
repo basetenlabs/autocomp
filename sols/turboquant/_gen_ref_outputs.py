@@ -29,7 +29,7 @@ Numerical contract:
     warmup, well under KernelBench's `precision=bf16` atol=rtol=1e-2.
 
 Run after rebuilding the prebuilt 4-bit `.so` (which lives at
-`/workspace/turboquant/build/lib/tq_mla_decode_tcgen05_4bit.*.so`).
+`/workspace/turboquant/build/lib/tq_mla_decode_4bit.*.so`).
 """
 from __future__ import annotations
 
@@ -62,7 +62,7 @@ VARIANTS = [
 
 OUT_PATH = _HERE / "_mla_decode_ref_outputs.pt"
 PREBUILT_SO = ("/workspace/turboquant/build/lib/"
-               "tq_mla_decode_tcgen05_4bit.cpython-312-x86_64-linux-gnu.so")
+               "tq_mla_decode_4bit.cpython-312-x86_64-linux-gnu.so")
 
 
 def make_inputs(B: int, K: int, seed: int, device: torch.device | str = "cuda"):
@@ -91,7 +91,7 @@ def main():
         raise RuntimeError("CUDA required to generate reference outputs")
 
     print(f"Loading prebuilt 4-bit kernel from {PREBUILT_SO}")
-    tq = _h._load_so(PREBUILT_SO, "tq_mla_decode_tcgen05_4bit")
+    tq = _h._load_so(PREBUILT_SO, "tq_mla_decode_4bit")
 
     payload: dict = {
         "softmax_scale": REF_SOFTMAX_SCALE,
