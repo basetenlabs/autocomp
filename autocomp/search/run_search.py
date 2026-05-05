@@ -44,7 +44,7 @@ def main():
     prob_id = 51
 
     sol_file = pathlib.Path("sols/turboquant/51_mla_decode_b200.py")
-    kernel_cu_path = pathlib.Path("/workspace/turboquant/csrc/sm100/decode/mla/tq_mla_decode_4bit.cu")
+    kernel_cu_path = pathlib.Path("/workspace/turboquant/csrc/sm100/decode/mla/sm100_fmha_mla_decode_4bit.cu")
     kernel_template = pathlib.Path("sols/turboquant/51_mla_decode_b200_template.py")
     kernel_local_includes = [
         pathlib.Path("/workspace/turboquant/csrc/sm100/decode/mla"),
